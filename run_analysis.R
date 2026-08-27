@@ -32,7 +32,7 @@ run_multinomial_flag <- parse_bool_arg(get_arg_value("--run_multinomial", args),
 
 required_packages <- c(
   "jsonlite", "readxl", "dplyr", "glmmTMB", "DHARMa",
-  "emmeans", "performance", "ggplot2", "broom.mixed"
+  "emmeans", "performance", "ggplot2", "broom.mixed", "car", "MASS"
 )
 
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
@@ -54,6 +54,8 @@ library(emmeans)
 library(performance)
 library(ggplot2)
 library(broom.mixed)
+library(car)
+library(MASS)
 
 message_line <- function(...) {
   cat(paste0(..., "\n"))
@@ -75,7 +77,57 @@ pick_first_existing <- function(candidates, available) {
   hit[[1]]
 }
 
+normalize_column_name <- function(name) {
+  if (is.null(name) || length(name) == 0) {
+    return(character(0))
+  }
+
+  name <- as.character(name)
+  if (length(name) == 0) {
+    return(character(0))
+  }
+
+  name[is.na(name)] <- ""
+  name <- trimws(name)
+  name[!nzchar(name)] <- ""
+
+  tolower(gsub("[[:space:]]+", " ", name))
+}
+
+resolve_column_names <- function(requested_cols, available_names) {
+  requested_cols <- requested_cols[!vapply(requested_cols, function(x) is.null(x) || length(x) == 0 || is.na(x) || !nzchar(trimws(as.character(x))), logical(1))]
+  requested_cols <- trimws(as.character(requested_cols))
+  if (length(requested_cols) == 0) {
+    return(character(0))
+  }
+
+  available_names <- as.character(available_names)
+  available_norm <- normalize_column_name(available_names)
+  resolved <- character(length(requested_cols))
+
+  for (i in seq_along(requested_cols)) {
+    name <- requested_cols[[i]]
+    if (name %in% available_names) {
+      resolved[[i]] <- name
+      next
+    }
+
+    norm <- normalize_column_name(name)
+    matches <- available_names[available_norm == norm]
+    if (length(matches) > 0) {
+      resolved[[i]] <- matches[[1]]
+    } else {
+      resolved[[i]] <- NA_character_
+    }
+  }
+
+  resolved
+}
+
 list_get <- function(lst, key, default = NULL) {
+  if (is.null(lst) || length(lst) == 0) {
+    return(default)
+  }
   val <- lst[[key]]
   if (is.null(val) || length(val) == 0) {
     return(default)
@@ -101,6 +153,95 @@ quote_terms <- function(vars) {
   paste0("`", vars, "`")
 }
 
+first_iv_structure_info <- function(iv_list) {
+  if (length(iv_list) == 0) {
+    return(list(
+      structure = "nothing",
+      crossed_with = "",
+      nested_with = character(0),
+      continuous = FALSE
+    ))
+  }
+
+  first <- iv_list[[1]]
+  structure <- tolower(list_get(first, "structure", "nothing"))
+  crossed_with <- list_get(first, "crossed_with", "")
+  nested_with <- list_get(first, "nested_with", character(0))
+  if (is.list(nested_with)) {
+    nested_with <- unlist(nested_with)
+  }
+  if (!is.character(nested_with)) {
+    nested_with <- character(0)
+  }
+  continuous <- identical(first[["continuous"]], TRUE)
+
+  list(
+    structure = structure,
+    crossed_with = crossed_with,
+    nested_with = nested_with[nzchar(nested_with)],
+    continuous = continuous
+  )
+}
+
+build_fixed_formula <- function(fixed_vars, iv_list) {
+  if (length(fixed_vars) == 0) {
+    return("1")
+  }
+
+  structure_info <- first_iv_structure_info(iv_list)
+  first_name <- list_get(iv_list[[1]], "name", "")
+  terms <- character(0)
+  excluded <- character(0)
+
+  if (nzchar(first_name) && first_name %in% fixed_vars) {
+    if (structure_info$structure == "crossed" && nzchar(structure_info$crossed_with)) {
+      terms <- c(terms, paste0("`", first_name, "` * `", structure_info$crossed_with, "`"))
+      excluded <- c(excluded, first_name, structure_info$crossed_with)
+    } else if (structure_info$structure == "nested" && length(structure_info$nested_with) > 0) {
+      nested_terms <- paste0("`", c(first_name, structure_info$nested_with), "`", collapse = " %in% ")
+      terms <- c(terms, nested_terms)
+      excluded <- c(excluded, first_name, structure_info$nested_with)
+    } else {
+      terms <- c(terms, paste0("`", first_name, "`"))
+      excluded <- c(excluded, first_name)
+    }
+  }
+
+  remaining <- setdiff(fixed_vars, excluded)
+  if (length(remaining) > 0) {
+    terms <- c(terms, paste(quote_terms(remaining), collapse = " + "))
+  }
+
+  if (length(terms) == 0) {
+    return("1")
+  }
+  paste(terms, collapse = " + ")
+}
+
+apply_continuous_transform <- function(model_df, iv_list) {
+  if (length(iv_list) == 0) {
+    return(model_df)
+  }
+
+  first <- iv_list[[1]]
+  if (!isTRUE(first[["continuous"]])) {
+    return(model_df)
+  }
+
+  first_name <- list_get(first, "name", "")
+  if (!nzchar(first_name) || !(first_name %in% names(model_df))) {
+    return(model_df)
+  }
+
+  numeric_column <- suppressWarnings(as.numeric(model_df[[first_name]]))
+  if (all(is.na(numeric_column))) {
+    warning(paste0("Continuous IV '", first_name, "' could not be coerced to numeric for z-transformation."))
+    return(model_df)
+  }
+  model_df[[first_name]] <- as.numeric(scale(numeric_column))
+  model_df
+}
+
 build_random_candidates_v2 <- function(animal_id, random_effect_vars, random_slope_vars) {
   base_intercept <- paste0("(1|`", animal_id, "`)")
 
@@ -124,6 +265,136 @@ build_random_candidates_v2 <- function(animal_id, random_effect_vars, random_slo
     base_intercept
   )
   unique(cands)
+}
+
+extract_formula_variables <- function(formula_text, available_names = NULL) {
+  if (is.null(formula_text) || !nzchar(trimws(formula_text))) {
+    return(character(0))
+  }
+
+  formula_text <- trimws(formula_text)
+
+  tryCatch({
+    rhs <- sub(".*~\\s*", "", formula_text)
+
+    quoted_matches <- regmatches(rhs, gregexpr("`[^`]+`", rhs, perl = TRUE))[[1]]
+    vars <- character(0)
+    for (m in quoted_matches) {
+      m_clean <- gsub("`", "", m)
+      if (!grepl("[*+:|()]|cbind|success|failure", m_clean)) {
+        vars <- c(vars, m_clean)
+      }
+    }
+
+    unquoted_matches <- regmatches(rhs, gregexpr("(?<![[:alnum:]_.])([A-Za-z_][A-Za-z0-9_.]*)", rhs, perl = TRUE))[[1]]
+    for (m in unquoted_matches) {
+      m_clean <- m
+      if (!grepl("[*+:|()]|cbind|success|failure|^DV$|^Animal_ID$|^AnimalID$|^TRUE$|^FALSE$|^NA$|^T$|^F$", m_clean)) {
+        vars <- c(vars, m_clean)
+      }
+    }
+
+    vars <- unique(vars)
+    if (!is.null(available_names) && length(available_names) > 0) {
+      available_names <- as.character(available_names)
+      available_norm <- normalize_column_name(available_names)
+      vars <- vars[vapply(vars, function(x) {
+        norm <- normalize_column_name(x)
+        any(available_norm == norm)
+      }, logical(1))]
+    }
+
+    vars
+  }, error = function(e) {
+    character(0)
+  })
+}
+
+correct_formula_case_insensitive <- function(formula_text, actual_colnames) {
+  if (is.null(formula_text) || !nzchar(trimws(formula_text))) {
+    return(formula_text)
+  }
+  
+  formula_text <- trimws(formula_text)
+  
+  # Build a mapping from lowercase names to actual names
+  mapping <- setNames(actual_colnames, tolower(actual_colnames))
+  
+  # Replace variables in formula more carefully
+  # We'll iterate through actual column names and replace them
+  for (i in seq_along(actual_colnames)) {
+    actual_name <- actual_colnames[i]
+    lower_name <- tolower(actual_name)
+    
+    # Skip if already has backticks
+    quoted_pattern <- paste0("`", actual_name, "`")
+    if (grepl(quoted_pattern, formula_text, fixed = TRUE)) {
+      next
+    }
+    
+    # Replace unquoted case-insensitive matches with word boundaries
+    # This pattern matches the variable name with word boundaries or special chars
+    pattern <- paste0("(?<![A-Za-z0-9_.])", lower_name, "(?![A-Za-z0-9_])")
+    formula_text <- gsub(pattern, paste0("`", actual_name, "`"), 
+                        formula_text, ignore.case = TRUE, perl = TRUE)
+  }
+  
+  formula_text
+}
+
+resolve_formula_text <- function(formula_text, response_name, animal_id, response_type = "standard") {
+  if (is.null(formula_text) || !nzchar(trimws(formula_text))) {
+    return(NULL)
+  }
+
+  formula_text <- trimws(formula_text)
+  if (is.null(response_name) || !nzchar(response_name)) {
+    response_name <- "response"
+  }
+
+  response_expr <- if (identical(response_type, "binomial")) {
+    "cbind(.__success, .__failure)"
+  } else {
+    paste0("`", response_name, "`")
+  }
+
+  animal_expr <- if (is.null(animal_id) || !nzchar(animal_id)) {
+    "Animal_ID"
+  } else {
+    paste0("`", animal_id, "`")
+  }
+
+  formula_text <- gsub("\\bDV\\b", response_expr, formula_text, perl = TRUE)
+  formula_text <- gsub("\\bAnimal_ID\\b", animal_expr, formula_text, perl = TRUE)
+  formula_text <- gsub("\\bAnimalID\\b", animal_expr, formula_text, perl = TRUE)
+  formula_text
+}
+
+build_formula_display <- function(response_name, fixed_formula_text, random_structure, response_type = "standard", formula_override = NULL, animal_id = NULL) {
+  if (!is.null(formula_override) && nzchar(trimws(formula_override))) {
+    resolved <- resolve_formula_text(formula_override, response_name, animal_id, response_type)
+    if (!is.null(resolved) && nzchar(resolved)) {
+      return(resolved)
+    }
+  }
+
+  if (is.null(response_name) || !nzchar(response_name)) {
+    response_name <- "response"
+  }
+  if (is.null(fixed_formula_text) || !nzchar(fixed_formula_text)) {
+    fixed_formula_text <- "1"
+  }
+  if (is.null(random_structure) || !nzchar(random_structure)) {
+    random_structure <- "1"
+  }
+
+  response_expr <- if (identical(response_type, "binomial")) {
+    "cbind(.__success, .__failure)"
+  } else {
+    paste0("`", response_name, "`")
+  }
+
+  paste0(response_expr, " ~ ", fixed_formula_text, " + ", random_structure)
 }
 
 report_image_markdown <- function(image_path) {
@@ -163,6 +434,156 @@ sig_code <- function(p) {
   if (p < 0.01) return("**")
   if (p < 0.05) return("*")
   ""
+}
+
+get_wald_tests <- function(model) {
+  if (is.null(model)) {
+    cat("[get_wald_tests] Model is NULL, returning NULL\n")
+    return(NULL)
+  }
+
+  wald_results <- tryCatch({
+    test_df <- NULL
+    model_classes <- paste(class(model), collapse=", ")
+    cat("[get_wald_tests] Model classes: ", model_classes, "\n")
+
+    if ("glmmTMB" %in% class(model) || "glmerMod" %in% class(model)) {
+      cat("[get_wald_tests] Attempting car::Anova with test.statistic='Chisq'\n")
+      test_df <- tryCatch({
+        result <- car::Anova(model, type = "III", test.statistic = "Chisq")
+        cat("[get_wald_tests] car::Anova result class: ", paste(class(result), collapse=", "), "\n")
+        if (!is.null(result)) cat("[get_wald_tests] car::Anova returned ", nrow(result), " rows\n")
+        result
+      }, error = function(e) {
+        cat("[get_wald_tests] car::Anova with test.statistic='Chisq' error: ", conditionMessage(e), "\n")
+        warning(paste0("car::Anova with test.statistic='Chisq' failed for glmmTMB (classes: ", model_classes, "): ", conditionMessage(e)), call. = FALSE)
+        NULL
+      })
+
+      if (is.null(test_df)) {
+        cat("[get_wald_tests] Attempting car::Anova without test.statistic\n")
+        test_df <- tryCatch({
+          result <- car::Anova(model, type = "III")
+          cat("[get_wald_tests] car::Anova result class: ", paste(class(result), collapse=", "), "\n")
+          if (!is.null(result)) cat("[get_wald_tests] car::Anova returned ", nrow(result), " rows\n")
+          result
+        }, error = function(e) {
+          cat("[get_wald_tests] car::Anova without test.statistic error: ", conditionMessage(e), "\n")
+          warning(paste0("car::Anova without test.statistic failed for glmmTMB (classes: ", model_classes, "): ", conditionMessage(e)), call. = FALSE)
+          NULL
+        })
+      }
+
+      if (is.null(test_df)) {
+        cat("[get_wald_tests] Attempting fallback broom.mixed::tidy\n")
+        test_df <- tryCatch({
+          result <- broom.mixed::tidy(model, effects = "fixed")
+          cat("[get_wald_tests] broom.mixed::tidy returned ", nrow(result), " rows\n")
+          result
+        }, error = function(e) {
+          cat("[get_wald_tests] broom.mixed::tidy error: ", conditionMessage(e), "\n")
+          warning(paste0("Fallback broom.mixed::tidy failed for glmmTMB: ", conditionMessage(e)), call. = FALSE)
+          NULL
+        })
+      }
+    } else {
+      cat("[get_wald_tests] Attempting car::Anova for non-glmmTMB model\n")
+      test_df <- tryCatch({
+        result <- car::Anova(model, type = "III")
+        cat("[get_wald_tests] car::Anova result class: ", paste(class(result), collapse=", "), "\n")
+        if (!is.null(result)) cat("[get_wald_tests] car::Anova returned ", nrow(result), " rows\n")
+        result
+      }, error = function(e) {
+        cat("[get_wald_tests] car::Anova error: ", conditionMessage(e), "\n")
+        warning(paste0("car::Anova failed for model class ", model_classes, ": ", conditionMessage(e)), call. = FALSE)
+        NULL
+      })
+    }
+
+    if (is.null(test_df)) {
+      cat("[get_wald_tests] test_df is NULL, returning NULL\n")
+      return(NULL)
+    }
+
+    test_df <- as.data.frame(test_df)
+    cat("[get_wald_tests] Converted to data.frame\n")
+
+    if (nrow(test_df) == 0) {
+      cat("[get_wald_tests] test_df has 0 rows, returning NULL\n")
+      return(NULL)
+    }
+
+    cat("[get_wald_tests] Processing ", nrow(test_df), " rows\n")
+
+    test_df$term <- rownames(test_df)
+    p_col_names <- c("Pr(>Chisq)", "Pr(>F)", "p.value", "Pr(Chi)")
+    existing_p_col <- intersect(p_col_names, names(test_df))
+    cat("[get_wald_tests] Found p-value column(s): ", paste(existing_p_col, collapse=", "), "\n")
+
+    if (length(existing_p_col) > 0) {
+      test_df$sig <- sapply(test_df[[existing_p_col[1]]], sig_code)
+    } else {
+      test_df$sig <- ""
+    }
+
+    col_order <- c("term", setdiff(names(test_df), c("term", "sig")), "sig")
+    test_df_out <- test_df[, col_order, drop = FALSE]
+    rownames(test_df_out) <- NULL
+
+    cat("[get_wald_tests] Returning wald tests with ", nrow(test_df_out), " rows and columns: ", paste(names(test_df_out), collapse=", "), "\n")
+    test_df_out
+  }, error = function(e) {
+    cat("[get_wald_tests] Top-level error: ", conditionMessage(e), "\n")
+    warning(paste0("Type III Wald test computation failed: ", conditionMessage(e)), call. = FALSE)
+    NULL
+  })
+
+  wald_results
+}
+
+sig_code <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else if (p < 0.1) "." else ""
+}
+
+format_p <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 0.001) "<0.001" else sprintf("%.4f", p)
+}
+
+extract_interaction_terms <- function(model, iv_names) {
+  interactions <- character(0)
+
+  tryCatch({
+    if (is.null(model)) return(character(0))
+
+    formula_str <- deparse(formula(model))
+    formula_str <- gsub("\\n", " ", formula_str)
+
+    rhs <- sub(".*~\\s*", "", formula_str)
+
+    for (i in seq_along(iv_names)) {
+      for (j in (i+1):length(iv_names)) {
+        if (j > length(iv_names)) next
+        iv1 <- iv_names[i]
+        iv2 <- iv_names[j]
+
+        pattern1 <- paste0("`?", iv1, "`?\\s*\\*\\s*`?", iv2, "`?")
+        pattern2 <- paste0("`?", iv2, "`?\\s*\\*\\s*`?", iv1, "`?")
+        pattern3 <- paste0("`?", iv1, "`?\\s*:\\s*`?", iv2, "`?")
+        pattern4 <- paste0("`?", iv2, "`?\\s*:\\s*`?", iv1, "`?")
+
+        if (grepl(pattern1, rhs, perl = TRUE) || grepl(pattern2, rhs, perl = TRUE) ||
+            grepl(pattern3, rhs, perl = TRUE) || grepl(pattern4, rhs, perl = TRUE)) {
+          interactions <- c(interactions, paste0(iv1, " : ", iv2))
+        }
+      }
+    }
+  }, error = function(e) {
+    NULL
+  })
+
+  unique(interactions)
 }
 
 safe_json <- function(x) {
@@ -205,10 +626,18 @@ analyze_single_dv <- function(
   iv_roles = NULL,
   iv_scopes = NULL,
   observation_cycle = 30,
-  non_visible_column = NULL
+  non_visible_column = NULL,
+  custom_formula = NULL,
+  cbind_pair_with = NULL,
+  cbind_pair_index = NULL
 ) {
   warnings <- c()
   status <- "ok"
+
+  # Correct custom formula variable names to match actual data column names (case-insensitive)
+  if (!is.null(custom_formula) && nzchar(trimws(custom_formula))) {
+    custom_formula <- correct_formula_case_insensitive(custom_formula, names(df))
+  }
 
   if (is.null(iv_roles) || length(iv_roles) != length(iv_names)) {
     iv_roles <- rep("fixed_effect", length(iv_names))
@@ -229,8 +658,30 @@ analyze_single_dv <- function(
     warnings <- c(warnings, "No fixed_effect/random_slope IV was selected; all IVs were included as fixed effects.")
   }
 
-  needed_cols <- unique(c(animal_id, fixed_vars, random_effect_vars, random_slope_vars, dv_name, non_visible_column))
-  model_df <- df %>% dplyr::select(all_of(needed_cols))
+  custom_formula_vars <- character(0)
+  if (!is.null(custom_formula) && nzchar(trimws(custom_formula))) {
+    custom_formula_vars <- extract_formula_variables(custom_formula, names(df))
+    custom_formula_vars <- setdiff(custom_formula_vars, c("DV", "Animal_ID", "AnimalID", dv_name, animal_id))
+  }
+
+  needed_cols <- unique(c(animal_id, fixed_vars, random_effect_vars, random_slope_vars, dv_name, non_visible_column, custom_formula_vars))
+  needed_cols <- needed_cols[!vapply(needed_cols, function(x) is.null(x) || length(x) == 0 || is.na(x) || !nzchar(trimws(as.character(x))), logical(1))]
+  resolved_needed_cols <- resolve_column_names(needed_cols, names(df))
+  missing_cols <- needed_cols[is.na(resolved_needed_cols)]
+  if (length(missing_cols) > 0) {
+    return(list(
+      dv = dv_name,
+      type = dv_type,
+      status = "failed",
+      message = paste0("Missing required columns: ", paste(missing_cols, collapse = ", ")),
+      warnings = warnings,
+      n_total = 0,
+      n_na = 0
+    ))
+  }
+
+  model_df <- df %>% dplyr::select(all_of(resolved_needed_cols))
+  model_df <- apply_continuous_transform(model_df, iv_list)
   n_total <- nrow(model_df)
 
   coerced <- coerce_numeric_response(model_df[[dv_name]])
@@ -244,6 +695,94 @@ analyze_single_dv <- function(
         " non-numeric value(s) that were converted to NA and removed."
       )
     )
+  }
+
+  if (dv_type == "binomial_cbind") {
+    if (is.null(cbind_pair_with) || !nzchar(cbind_pair_with) || !(cbind_pair_with %in% names(model_df))) {
+      return(list(
+        dv = dv_name,
+        type = dv_type,
+        status = "failed",
+        message = "Missing or invalid cbind_pair_with for binomial_cbind DV type.",
+        warnings = warnings,
+        n_total = nrow(model_df),
+        n_na = 0
+      ))
+    }
+
+    model_df$.__success <- model_df[[dv_name]]
+    model_df$.__failure <- model_df[[cbind_pair_with]]
+
+    coerced_success <- coerce_numeric_response(model_df$.__success)
+    model_df$.__success <- coerced_success$values
+    coerced_failure <- coerce_numeric_response(model_df$.__failure)
+    model_df$.__failure <- coerced_failure$values
+
+    if (coerced_success$converted_bad > 0) {
+      warnings <- c(warnings, paste0("Success column '", dv_name, "' had ", coerced_success$converted_bad, " non-numeric value(s) converted to NA."))
+    }
+    if (coerced_failure$converted_bad > 0) {
+      warnings <- c(warnings, paste0("Failure column '", cbind_pair_with, "' had ", coerced_failure$converted_bad, " non-numeric value(s) converted to NA."))
+    }
+
+    invalid <- is.na(model_df$.__success) | is.na(model_df$.__failure) | model_df$.__success < 0 | model_df$.__failure < 0
+    if (any(invalid)) {
+      warnings <- c(warnings, paste0("binomial_cbind: dropped ", sum(invalid), " row(s) with invalid success/failure counts."))
+      model_df <- model_df[!invalid, , drop = FALSE]
+    }
+
+    if (nrow(model_df) < 10) {
+      return(list(
+        dv = paste0(dv_name, " (success) vs ", cbind_pair_with, " (failure)"),
+        type = dv_type,
+        status = "failed",
+        message = "Not enough usable rows (<10) for binomial cbind modeling.",
+        warnings = warnings,
+        n_total = nrow(model_df),
+        n_na = sum(is.na(model_df[[dv_name]]))
+      ))
+    }
+
+    model_df <- as_factor_if_needed(model_df, unique(c(animal_id, fixed_vars, random_effect_vars)))
+    fixed_formula_text <- build_fixed_formula(fixed_vars, iv_list)
+    random_candidates <- build_random_candidates_v2(animal_id, random_effect_vars, random_slope_vars)
+
+    model <- NULL
+    selected_random <- NULL
+    fit_errors <- c()
+    fit_warnings <- c()
+    for (rand in random_candidates) {
+      model_formula <- as.formula(paste0("cbind(.__success, .__failure) ~ ", fixed_formula_text, " + ", rand))
+      fit_try <- tryCatch({
+        withCallingHandlers({
+          glmmTMB(formula = model_formula, data = model_df, family = binomial(link = "logit"), ziformula = ~0,
+            control = glmmTMBControl(optimizer = optim, optArgs = list(method = "BFGS"), profile = FALSE))
+        }, warning = function(w) {
+          fit_warnings <<- c(fit_warnings, paste0("[", rand, "] ", conditionMessage(w)))
+          invokeRestart("muffleWarning")
+        })
+      }, error = function(e) {
+        fit_errors <<- c(fit_errors, paste0("[", rand, "] ", conditionMessage(e)))
+        NULL
+      })
+      if (!is.null(fit_try)) {
+        model <- fit_try
+        selected_random <- rand
+        break
+      }
+    }
+
+    if (is.null(model)) {
+      return(list(dv = dv_name, dv_pair = cbind_pair_with, type = dv_type, status = "failed",
+        message = "Binomial cbind GLMM model fitting failed.", warnings = c(warnings, paste0("Fit errors: ", paste(fit_errors, collapse = "; "))), n_total = nrow(model_df), n_na = sum(is.na(model_df[[dv_name]]))))
+    }
+
+    return(list(dv = dv_name, dv_pair = cbind_pair_with, type = dv_type, status = "ok", n_total = nrow(model_df),
+      n_na = sum(is.na(model_df[[dv_name]])), selected_random = selected_random, family_used = "binomial",
+      fit_warnings = fit_warnings,
+      method_text = "Count-based proportions were modeled with binomial GLMM (logit link).",
+      formula_used = build_formula_display(paste0("cbind(`", dv_name, "`, `", cbind_pair_with, "`)"), fixed_formula_text, selected_random, response_type = "binomial", formula_override = custom_formula, animal_id = animal_id),
+      warnings = warnings))
   }
 
   if (dv_type == "proportion_without_non_visible") {
@@ -283,11 +822,7 @@ analyze_single_dv <- function(
     factor_vars <- unique(c(animal_id, fixed_vars, random_effect_vars))
     model_df <- as_factor_if_needed(model_df, factor_vars)
 
-    fixed_formula_text <- if (length(fixed_vars) > 0) {
-      paste(quote_terms(fixed_vars), collapse = " + ")
-    } else {
-      "1"
-    }
+    fixed_formula_text <- build_fixed_formula(fixed_vars, iv_list)
     random_candidates <- build_random_candidates_v2(animal_id, random_effect_vars, random_slope_vars)
 
     run_binomial_variant <- function(label, subtract_non_visible) {
@@ -330,23 +865,38 @@ analyze_single_dv <- function(
       model <- NULL
       selected_random <- NULL
       fit_errors <- c()
+      fit_warnings <- c()
       used_family <- "binomial"
       used_zi <- FALSE
 
       for (rand in random_candidates) {
-        model_formula <- as.formula(paste0("cbind(.__success, .__failure) ~ ", fixed_formula_text, " + ", rand))
+        model_formula <- if (!is.null(custom_formula) && nzchar(trimws(custom_formula))) {
+          resolved_formula <- resolve_formula_text(custom_formula, dv_name, animal_id, response_type = "binomial")
+          if (!is.null(resolved_formula) && nzchar(resolved_formula)) {
+            as.formula(resolved_formula)
+          } else {
+            as.formula(paste0("cbind(.__success, .__failure) ~ ", fixed_formula_text, " + ", rand))
+          }
+        } else {
+          as.formula(paste0("cbind(.__success, .__failure) ~ ", fixed_formula_text, " + ", rand))
+        }
         fit_try <- tryCatch({
-          glmmTMB(
-            formula = model_formula,
-            data = local_df,
-            family = binomial(link = "logit"),
-            ziformula = ~0,
-            control = glmmTMBControl(
-              optimizer = optim,
-              optArgs = list(method = "BFGS"),
-              profile = FALSE
+          withCallingHandlers({
+            glmmTMB(
+              formula = model_formula,
+              data = local_df,
+              family = binomial(link = "logit"),
+              ziformula = ~0,
+              control = glmmTMBControl(
+                optimizer = optim,
+                optArgs = list(method = "BFGS"),
+                profile = FALSE
+              )
             )
-          )
+          }, warning = function(w) {
+            fit_warnings <<- c(fit_warnings, paste0("[", rand, "] ", conditionMessage(w)))
+            invokeRestart("muffleWarning")
+          })
         }, error = function(e) {
           fit_errors <<- c(fit_errors, paste0("[", rand, "] ", conditionMessage(e)))
           NULL
@@ -365,7 +915,8 @@ analyze_single_dv <- function(
 
       if (is.null(model)) {
         plan_b_used <- TRUE
-        local_warnings <- c(local_warnings, paste0(label, ": mixed model failed; switched to GLM + cluster-robust SE (Plan B)."))
+        error_details <- if (length(fit_errors) > 0) paste(fit_errors, collapse = "; ") else "Unknown error"
+        local_warnings <- c(local_warnings, paste0(label, ": mixed model failed. Error(s): ", error_details, ". Switched to GLM + cluster-robust SE (Plan B)."))
         pb <- tryCatch({
           glm_formula <- as.formula(paste0("cbind(.__success, .__failure) ~ ", fixed_formula_text))
           glm_fit <- glm(glm_formula, data = local_df, family = quasibinomial(link = "logit"))
@@ -409,7 +960,22 @@ analyze_single_dv <- function(
       }
 
       dh <- tryCatch({
-        sim <- DHARMa::simulateResiduals(fittedModel = model, n = 500)
+        sim <- tryCatch({
+          DHARMa::simulateResiduals(fittedModel = model, n = 500)
+        }, error = function(e) {
+          if (grepl("rnegbin|rbinom|rgamma|rbeta", conditionMessage(e), ignore.case = TRUE)) {
+            if (requireNamespace("MASS", quietly = TRUE)) {
+              environment(DHARMa::simulateResiduals)$rnegbin <- MASS::rnegbin
+            }
+            tryCatch({
+              DHARMa::simulateResiduals(fittedModel = model, n = 500)
+            }, error = function(e2) {
+              stop(paste0("DHARMa simulation failed after attempting to provide MASS functions: ", conditionMessage(e2)))
+            })
+          } else {
+            stop(e)
+          }
+        })
         list(
           sim = sim,
           uniformity = DHARMa::testUniformity(sim),
@@ -426,18 +992,26 @@ analyze_single_dv <- function(
         if (is.finite(disp_p) && disp_p < 0.05) {
           bb_formula <- formula(model)
           bb_refit <- tryCatch({
-            glmmTMB(
-              formula = bb_formula,
-              data = local_df,
-              family = betabinomial(link = "logit"),
-              ziformula = ~0,
-              control = glmmTMBControl(
-                optimizer = optim,
-                optArgs = list(method = "BFGS"),
-                profile = FALSE
+            withCallingHandlers({
+              glmmTMB(
+                formula = bb_formula,
+                data = local_df,
+                family = betabinomial(link = "logit"),
+                ziformula = ~0,
+                control = glmmTMBControl(
+                  optimizer = optim,
+                  optArgs = list(method = "BFGS"),
+                  profile = FALSE
+                )
               )
-            )
-          }, error = function(e) NULL)
+            }, warning = function(w) {
+              fit_warnings <<- c(fit_warnings, paste0("[Beta-binomial refit] ", conditionMessage(w)))
+              invokeRestart("muffleWarning")
+            })
+          }, error = function(e) {
+            fit_warnings <<- c(fit_warnings, paste0("[Beta-binomial refit] ", conditionMessage(e)))
+            NULL
+          })
 
           if (!is.null(bb_refit)) {
             model <- bb_refit
@@ -492,10 +1066,14 @@ analyze_single_dv <- function(
         list(marginal = NA_real_, conditional = NA_real_)
       })
 
+      wald_tests_tbl <- get_wald_tests(model)
+
       emmeans_tbl <- NULL
       contrasts_tbl <- NULL
       emmeans_plot_path <- NULL
+      emmeans_plot_paths <- list()
       emmeans_within_plot_path <- NULL
+      emmeans_within_plot_paths <- list()
 
       between_fixed_ivs <- unique(iv_names[iv_roles %in% c("fixed_effect", "random_slope") & tolower(iv_scopes) == "between_subject"])
       within_fixed_ivs  <- unique(iv_names[iv_roles %in% c("fixed_effect", "random_slope") & tolower(iv_scopes) == "within_subject"])
@@ -503,27 +1081,69 @@ analyze_single_dv <- function(
       within_iv  <- if (length(within_fixed_ivs)  > 0) within_fixed_ivs[1]  else NA_character_
       first_iv   <- between_iv
 
-      if (!is.na(first_iv) && nzchar(first_iv)) {
-        emm <- tryCatch(emmeans::emmeans(model, specs = first_iv, type = "response"), error = function(e) NULL)
-        if (!is.null(emm)) {
-          emmeans_tbl <- tryCatch(as.data.frame(emm), error = function(e) NULL)
-          contrasts_tbl <- tryCatch(as.data.frame(contrast(emm, method = "pairwise", adjust = "none")), error = function(e) NULL)
-          if (!is.null(contrasts_tbl) && "estimate" %in% names(contrasts_tbl)) {
-            contrasts_tbl$effect_size <- exp(contrasts_tbl$estimate)
+      if (length(between_fixed_ivs) > 0) {
+        for (iv in between_fixed_ivs) {
+          if (is.na(iv) || !nzchar(iv)) next
+
+          emm <- tryCatch(
+            emmeans::emmeans(model, specs = iv, type = "response"),
+            error = function(e) {
+              warnings <<- c(warnings, paste0("EMMeans failed for between-subject IV '", iv, "': ", conditionMessage(e)))
+              NULL
+            }
+          )
+          if (is.null(emm)) next
+
+          emmeans_tbl_iv <- tryCatch(
+            as.data.frame(emm),
+            error = function(e) {
+              warnings <<- c(warnings, paste0("EMMeans table conversion failed for IV '", iv, "': ", conditionMessage(e)))
+              NULL
+            }
+          )
+          if (!is.null(emmeans_tbl_iv)) {
+            emmeans_tbl_iv$IV <- iv
+            if (is.null(emmeans_tbl)) {
+              emmeans_tbl <- emmeans_tbl_iv
+            } else {
+              emmeans_tbl <- dplyr::bind_rows(emmeans_tbl, emmeans_tbl_iv)
+            }
           }
 
-          if (!is.null(emmeans_tbl) && first_iv %in% names(emmeans_tbl)) {
-            emmeans_plot_path <- file.path(output_dir, "figures", paste0("emmeans_", dv_name, "_", label, ".png"))
-            estimate_col <- pick_first_existing(c("response", "prob", "emmean"), names(emmeans_tbl))
-            lower_col <- pick_first_existing(c("lower.CL", "asymp.LCL", "LCL"), names(emmeans_tbl))
-            upper_col <- pick_first_existing(c("upper.CL", "asymp.UCL", "UCL"), names(emmeans_tbl))
+          contrasts_tbl_iv <- tryCatch(
+            as.data.frame(contrast(emm, method = "pairwise", adjust = "none")),
+            error = function(e) {
+              warnings <<- c(warnings, paste0("EMMeans contrasts failed for between-subject IV '", iv, "': ", conditionMessage(e)))
+              NULL
+            }
+          )
+          if (!is.null(contrasts_tbl_iv)) {
+            contrasts_tbl_iv$IV <- iv
+            if ("estimate" %in% names(contrasts_tbl_iv)) {
+              contrasts_tbl_iv$effect_size <- exp(contrasts_tbl_iv$estimate)
+            } else {
+              contrasts_tbl_iv$effect_size <- NA_real_
+            }
+            if (is.null(contrasts_tbl)) {
+              contrasts_tbl <- contrasts_tbl_iv
+            } else {
+              contrasts_tbl <- dplyr::bind_rows(contrasts_tbl, contrasts_tbl_iv)
+            }
+          }
+
+          if (!is.null(emmeans_tbl_iv) && iv %in% names(emmeans_tbl_iv)) {
+            iv_label <- gsub("[^A-Za-z0-9]+", "_", iv)
+            emmeans_plot_path_iv <- file.path(output_dir, "figures", paste0("emmeans_", dv_name, "_", label, "_", iv_label, ".png"))
+            estimate_col <- pick_first_existing(c("response", "prob", "emmean"), names(emmeans_tbl_iv))
+            lower_col <- pick_first_existing(c("lower.CL", "asymp.LCL", "LCL"), names(emmeans_tbl_iv))
+            upper_col <- pick_first_existing(c("upper.CL", "asymp.UCL", "UCL"), names(emmeans_tbl_iv))
 
             if (!is.null(estimate_col)) {
-              p <- ggplot(emmeans_tbl, aes(x = .data[[first_iv]], y = .data[[estimate_col]])) +
+              p <- ggplot(emmeans_tbl_iv, aes(x = .data[[iv]], y = .data[[estimate_col]])) +
                 geom_point(size = 2) +
                 labs(
-                  title = paste0("Estimated Marginal Means: ", dv_name, " (", label, ") \u2014 between-subject"),
-                  x = first_iv,
+                  title = paste0("Estimated Marginal Means: ", dv_name, " (", label, ") \u2014 between-subject - ", iv),
+                  x = iv,
                   y = dv_name
                 ) +
                 theme_minimal(base_size = 12) +
@@ -531,32 +1151,57 @@ analyze_single_dv <- function(
               if (!is.null(lower_col) && !is.null(upper_col)) {
                 p <- p + geom_errorbar(aes(ymin = .data[[lower_col]], ymax = .data[[upper_col]]), width = 0.2)
               }
-              tryCatch({
-                ggsave(emmeans_plot_path, plot = p, width = 7, height = 4.5, dpi = 150)
+              success <- tryCatch({
+                ggsave(emmeans_plot_path_iv, plot = p, width = 7, height = 4.5, dpi = 150)
+                TRUE
               }, error = function(e) {
-                emmeans_plot_path <<- NULL
+                warnings <<- c(warnings, paste0("EMMeans plot save failed for between-subject IV '", iv, "': ", conditionMessage(e)))
+                FALSE
               })
+              if (success) {
+                emmeans_plot_paths[[length(emmeans_plot_paths) + 1]] <- emmeans_plot_path_iv
+                if (is.null(emmeans_plot_path)) {
+                  emmeans_plot_path <- emmeans_plot_path_iv
+                }
+              }
             }
           }
         }
       }
 
-      if (!is.na(within_iv) && nzchar(within_iv)) {
-        emm_w <- tryCatch(emmeans::emmeans(model, specs = within_iv, type = "response"), error = function(e) NULL)
-        if (!is.null(emm_w)) {
-          emmeans_w_tbl <- tryCatch(as.data.frame(emm_w), error = function(e) NULL)
-          if (!is.null(emmeans_w_tbl) && within_iv %in% names(emmeans_w_tbl)) {
-            emmeans_within_plot_path <- file.path(output_dir, "figures", paste0("emmeans_", dv_name, "_", label, "_within.png"))
-            estimate_col_w <- pick_first_existing(c("response", "prob", "emmean"), names(emmeans_w_tbl))
-            lower_col_w    <- pick_first_existing(c("lower.CL", "asymp.LCL", "LCL"), names(emmeans_w_tbl))
-            upper_col_w    <- pick_first_existing(c("upper.CL", "asymp.UCL", "UCL"), names(emmeans_w_tbl))
+      if (length(within_fixed_ivs) > 0) {
+        for (iv in within_fixed_ivs) {
+          if (is.na(iv) || !nzchar(iv)) next
+
+          emm_w <- tryCatch(
+            emmeans::emmeans(model, specs = iv, type = "response"),
+            error = function(e) {
+              warnings <<- c(warnings, paste0("EMMeans failed for within-subject IV '", iv, "': ", conditionMessage(e)))
+              NULL
+            }
+          )
+          if (is.null(emm_w)) next
+
+          emmeans_w_tbl_iv <- tryCatch(
+            as.data.frame(emm_w),
+            error = function(e) {
+              warnings <<- c(warnings, paste0("EMMeans within-subject table conversion failed for IV '", iv, "': ", conditionMessage(e)))
+              NULL
+            }
+          )
+          if (!is.null(emmeans_w_tbl_iv) && iv %in% names(emmeans_w_tbl_iv)) {
+            iv_label <- gsub("[^A-Za-z0-9]+", "_", iv)
+            emmeans_within_plot_path_iv <- file.path(output_dir, "figures", paste0("emmeans_", dv_name, "_", label, "_within_", iv_label, ".png"))
+            estimate_col_w <- pick_first_existing(c("response", "prob", "emmean"), names(emmeans_w_tbl_iv))
+            lower_col_w    <- pick_first_existing(c("lower.CL", "asymp.LCL", "LCL"), names(emmeans_w_tbl_iv))
+            upper_col_w    <- pick_first_existing(c("upper.CL", "asymp.UCL", "UCL"), names(emmeans_w_tbl_iv))
 
             if (!is.null(estimate_col_w)) {
-              pw <- ggplot(emmeans_w_tbl, aes(x = .data[[within_iv]], y = .data[[estimate_col_w]])) +
+              pw <- ggplot(emmeans_w_tbl_iv, aes(x = .data[[iv]], y = .data[[estimate_col_w]])) +
                 geom_point(size = 2) +
                 labs(
-                  title = paste0("Estimated Marginal Means: ", dv_name, " (", label, ") \u2014 within-subject"),
-                  x = within_iv,
+                  title = paste0("Estimated Marginal Means: ", dv_name, " (", label, ") \u2014 within-subject - ", iv),
+                  x = iv,
                   y = dv_name
                 ) +
                 theme_minimal(base_size = 12) +
@@ -564,11 +1209,19 @@ analyze_single_dv <- function(
               if (!is.null(lower_col_w) && !is.null(upper_col_w)) {
                 pw <- pw + geom_errorbar(aes(ymin = .data[[lower_col_w]], ymax = .data[[upper_col_w]]), width = 0.2)
               }
-              tryCatch({
-                ggsave(emmeans_within_plot_path, plot = pw, width = 7, height = 4.5, dpi = 150)
+              success <- tryCatch({
+                ggsave(emmeans_within_plot_path_iv, plot = pw, width = 7, height = 4.5, dpi = 150)
+                TRUE
               }, error = function(e) {
-                emmeans_within_plot_path <<- NULL
+                warnings <<- c(warnings, paste0("EMMeans within-subject plot save failed for IV '", iv, "': ", conditionMessage(e)))
+                FALSE
               })
+              if (success) {
+                emmeans_within_plot_paths[[length(emmeans_within_plot_paths) + 1]] <- emmeans_within_plot_path_iv
+                if (is.null(emmeans_within_plot_path)) {
+                  emmeans_within_plot_path <- emmeans_within_plot_path_iv
+                }
+              }
             }
           }
         }
@@ -595,13 +1248,17 @@ analyze_single_dv <- function(
         fit_errors = fit_errors,
         warnings = local_warnings,
         fixed_effects = fixed_tbl,
+        wald_tests = wald_tests_tbl,
         r2 = r2_values,
         emmeans = emmeans_tbl,
         contrasts = contrasts_tbl,
         effect_metric = "Odds Ratio",
         qq_plot_path = qq_plot_path,
         emmeans_plot_path = emmeans_plot_path,
+        emmeans_plot_paths = emmeans_plot_paths,
         emmeans_within_plot_path = emmeans_within_plot_path,
+        emmeans_within_plot_paths = emmeans_within_plot_paths,
+        formula_used = build_formula_display(dv_name, fixed_formula_text, selected_random, response_type = "binomial", formula_override = custom_formula, animal_id = animal_id),
         dharma = if (is.null(dh)) NULL else list(
           uniformity_p = tryCatch(unname(dh$uniformity$p.value), error = function(e) NA_real_),
           dispersion_p = tryCatch(unname(dh$dispersion$p.value), error = function(e) NA_real_),
@@ -632,6 +1289,7 @@ analyze_single_dv <- function(
         "Zero-inflation was checked after fitting; ZOIB was not used for this count-trial setup. ",
         "Post-hoc contrasts are FDR-corrected across all DVs (cross-DV Benjamini-Hochberg)."
       ),
+      formula_used = list_get(without_nv, "formula_used", NA_character_),
       warnings = unique(c(warnings, list_get(without_nv, "warnings", character(0)))),
       analyses = list(
         without_non_visible = without_nv
@@ -685,6 +1343,11 @@ analyze_single_dv <- function(
     family_obj <- Gamma(link = "log")
     link_name <- "log"
     effect_metric <- "Response Ratio"
+  } else if (dv_type == "gaussian") {
+    family_obj <- gaussian(link = "identity")
+    link_name <- "identity"
+    effect_metric <- "Difference"
+    warnings <- c(warnings, "Gaussian LMM: assumes continuous data with residuals normally distributed around zero (homoscedastic). Use for non-skewed, roughly symmetric data.")
   } else if (dv_type == "proportion") {
     y <- model_df[[dv_name]]
 
@@ -718,6 +1381,41 @@ analyze_single_dv <- function(
     family_obj <- beta_family(link = "logit")
     link_name <- "logit"
     effect_metric <- "Odds Ratio"
+  } else if (dv_type == "binomial_cbind") {
+    if (is.null(cbind_pair_with) || !nzchar(cbind_pair_with)) {
+      return(list(
+        dv = dv_name,
+        type = dv_type,
+        status = "failed",
+        message = "Binomial cbind: no pair column specified.",
+        warnings = warnings,
+        n_total = n_total,
+        n_na = n_na
+      ))
+    }
+    if (!(cbind_pair_with %in% names(model_df))) {
+      return(list(
+        dv = dv_name,
+        type = dv_type,
+        status = "failed",
+        message = paste0("Binomial cbind: pair column '", cbind_pair_with, "' not found in data."),
+        warnings = warnings,
+        n_total = n_total,
+        n_na = n_na
+      ))
+    }
+    success_counts <- model_df[[dv_name]]
+    failure_counts <- model_df[[cbind_pair_with]]
+    bad_counts <- sum((success_counts < 0 | failure_counts < 0), na.rm = TRUE)
+    if (bad_counts > 0) {
+      warnings <- c(warnings, paste0("Binomial cbind DV has ", bad_counts, " row(s) with negative counts; those rows were dropped."))
+      model_df <- model_df %>% dplyr::filter(.data[[dv_name]] >= 0, .data[[cbind_pair_with]] >= 0)
+    }
+    response_col <- paste0("cbind(`", dv_name, "`, `", cbind_pair_with, "`)")
+    family_obj <- binomial(link = "logit")
+    link_name <- "logit"
+    effect_metric <- "Odds Ratio"
+    warnings <- c(warnings, "Binomial GLM with cbind(success, failure) response: models proportion of successes in count data.")
   } else {
     return(list(
       dv = dv_name,
@@ -742,28 +1440,44 @@ analyze_single_dv <- function(
     ))
   }
 
-  fixed_formula_text <- if (length(fixed_vars) > 0) paste0("`", fixed_vars, "`", collapse = " + ") else "1"
+  fixed_formula_text <- build_fixed_formula(fixed_vars, iv_list)
   random_candidates <- build_random_candidates_v2(animal_id, random_effect_vars, random_slope_vars)
 
   model <- NULL
   selected_random <- NULL
   fit_errors <- c()
+  fit_warnings <- c()
+  used_family <- if (dv_type == "counts") "negative-binomial" else if (dv_type == "rt") "gamma" else if (dv_type == "gaussian") "gaussian" else if (dv_type == "binomial_cbind") "binomial" else "beta"
 
   for (rand in random_candidates) {
-    model_formula <- as.formula(paste0("`", response_col, "` ~ ", fixed_formula_text, " + ", rand))
+    model_formula <- if (!is.null(custom_formula) && nzchar(trimws(custom_formula))) {
+      resolved_formula <- resolve_formula_text(custom_formula, response_col, animal_id)
+      if (!is.null(resolved_formula) && nzchar(resolved_formula)) {
+        as.formula(resolved_formula)
+      } else {
+        as.formula(paste0("`", response_col, "` ~ ", fixed_formula_text, " + ", rand))
+      }
+    } else {
+      as.formula(paste0("`", response_col, "` ~ ", fixed_formula_text, " + ", rand))
+    }
 
     fit_try <- tryCatch({
-      glmmTMB(
-        formula = model_formula,
-        data = model_df,
-        family = family_obj,
-        ziformula = if (used_zi) ~1 else ~0,
-        control = glmmTMBControl(
-          optimizer = optim,
-          optArgs = list(method = "BFGS"),
-          profile = FALSE
+      withCallingHandlers({
+        glmmTMB(
+          formula = model_formula,
+          data = model_df,
+          family = family_obj,
+          ziformula = if (used_zi) ~1 else ~0,
+          control = glmmTMBControl(
+            optimizer = optim,
+            optArgs = list(method = "BFGS"),
+            profile = FALSE
+          )
         )
-      )
+      }, warning = function(w) {
+        fit_warnings <<- c(fit_warnings, paste0("[", rand, "] ", conditionMessage(w)))
+        invokeRestart("muffleWarning")
+      })
     }, error = function(e) {
       fit_errors <<- c(fit_errors, paste0("[", rand, "] ", conditionMessage(e)))
       NULL
@@ -781,7 +1495,8 @@ analyze_single_dv <- function(
   robust_table <- NULL
 
   if (is.null(model)) {
-    warnings <- c(warnings, "Mixed model did not converge with random-effects funnel; switched to GLM + cluster-robust SE (Plan B).")
+    error_details <- if (length(fit_errors) > 0) paste(fit_errors, collapse = "; ") else "Unknown error"
+    warnings <- c(warnings, paste0("Mixed model did not converge with random-effects funnel. Attempted random structures: ", paste(random_candidates, collapse = ", "), ". Error(s): ", error_details, ". Switched to GLM + cluster-robust SE (Plan B)."))
     plan_b_used <- TRUE
 
     pb <- tryCatch({
@@ -789,6 +1504,8 @@ analyze_single_dv <- function(
         fit_plan_b(model_df, response_col, fixed_formula_text, MASS::negative.binomial(theta = 1), animal_id)
       } else if (dv_type == "rt") {
         fit_plan_b(model_df, response_col, fixed_formula_text, Gamma(link = "log"), animal_id)
+      } else if (dv_type == "gaussian") {
+        fit_plan_b(model_df, response_col, fixed_formula_text, gaussian(link = "identity"), animal_id)
       } else {
         fit_plan_b(model_df, response_col, fixed_formula_text, quasibinomial(link = "logit"), animal_id)
       }
@@ -812,11 +1529,29 @@ analyze_single_dv <- function(
     robust_table <- pb$robust_table
     plan_b_note <- pb$robust_note
     selected_random <- "Plan B (GLM)"
+    if (dv_type %in% c("proportion", "binomial_cbind")) {
+      used_family <- "quasi-binomial"
+    }
   }
 
   # DHARMa diagnostics
   dh <- tryCatch({
-    sim <- DHARMa::simulateResiduals(fittedModel = model, n = 500)
+    sim <- tryCatch({
+      DHARMa::simulateResiduals(fittedModel = model, n = 500)
+    }, error = function(e) {
+      if (grepl("rnegbin|rbinom|rgamma|rbeta", conditionMessage(e), ignore.case = TRUE)) {
+        if (requireNamespace("MASS", quietly = TRUE)) {
+          environment(DHARMa::simulateResiduals)$rnegbin <- MASS::rnegbin
+        }
+        tryCatch({
+          DHARMa::simulateResiduals(fittedModel = model, n = 500)
+        }, error = function(e2) {
+          stop(paste0("DHARMa simulation failed after attempting to provide MASS functions: ", conditionMessage(e2)))
+        })
+      } else {
+        stop(e)
+      }
+    })
     list(
       sim = sim,
       uniformity = DHARMa::testUniformity(sim),
@@ -943,7 +1678,22 @@ analyze_single_dv <- function(
       )
     } else {
       rt_dh <- tryCatch({
-        sim <- DHARMa::simulateResiduals(fittedModel = rt_model, n = 500)
+        sim <- tryCatch({
+          DHARMa::simulateResiduals(fittedModel = rt_model, n = 500)
+        }, error = function(e) {
+          if (grepl("rnegbin|rbinom|rgamma|rbeta", conditionMessage(e), ignore.case = TRUE)) {
+            if (requireNamespace("MASS", quietly = TRUE)) {
+              environment(DHARMa::simulateResiduals)$rnegbin <- MASS::rnegbin
+            }
+            tryCatch({
+              DHARMa::simulateResiduals(fittedModel = rt_model, n = 500)
+            }, error = function(e2) {
+              stop(paste0("DHARMa simulation failed after attempting to provide MASS functions: ", conditionMessage(e2)))
+            })
+          } else {
+            stop(e)
+          }
+        })
         list(
           sim = sim,
           uniformity = DHARMa::testUniformity(sim),
@@ -960,6 +1710,8 @@ analyze_single_dv <- function(
         broom.mixed::tidy(rt_model, effects = "fixed", conf.int = TRUE)
       }, error = function(e) NULL)
 
+      rt_wald_tests <- get_wald_tests(rt_model)
+
       rt_r2 <- tryCatch({
         r2 <- performance::r2_nakagawa(rt_model)
         list(marginal = unname(r2$R2_marginal), conditional = unname(r2$R2_conditional))
@@ -974,6 +1726,7 @@ analyze_single_dv <- function(
         fit_errors = rt_fit_errors,
         warnings = rt_warnings,
         fixed_effects = rt_fixed,
+        wald_tests = rt_wald_tests,
         r2 = rt_r2,
         dharma = if (is.null(rt_dh)) NULL else list(
           uniformity_p = tryCatch(unname(rt_dh$uniformity$p.value), error = function(e) NA_real_),
@@ -1011,6 +1764,8 @@ analyze_single_dv <- function(
     list(marginal = NA_real_, conditional = NA_real_)
   })
 
+  wald_tests_tbl <- get_wald_tests(model)
+
   # EMMeans: between-subject IV plot + within-subject IV plot (if present)
   emmeans_tbl <- NULL
   contrasts_tbl <- NULL
@@ -1023,37 +1778,58 @@ analyze_single_dv <- function(
   within_iv  <- if (length(within_fixed_ivs)  > 0) within_fixed_ivs[1]  else NA_character_
   first_iv   <- between_iv
 
-  if (!is.na(first_iv) && nzchar(first_iv)) {
-    emm <- tryCatch({
-      # Use character spec to avoid formula/backtick edge cases with names like EE/SE.
-      emmeans::emmeans(model, specs = first_iv, type = "response")
-    }, error = function(e) {
-      warnings <<- c(warnings, paste0("EMMeans failed: ", conditionMessage(e)))
-      NULL
-    })
+  if (length(between_fixed_ivs) > 0) {
+    for (iv in between_fixed_ivs) {
+      if (is.na(iv) || !nzchar(iv)) next
 
-    if (!is.null(emm)) {
-      emmeans_tbl <- tryCatch(as.data.frame(emm), error = function(e) NULL)
-      contrasts_tbl <- tryCatch(as.data.frame(contrast(emm, method = "pairwise", adjust = "none")), error = function(e) NULL)
+      emm <- tryCatch({
+        emmeans::emmeans(model, specs = iv, type = "response")
+      }, error = function(e) {
+        warnings <<- c(warnings, paste0("EMMeans failed for between-subject IV '", iv, "': ", conditionMessage(e)))
+        NULL
+      })
+      if (is.null(emm)) next
 
-      if (!is.null(contrasts_tbl) && "estimate" %in% names(contrasts_tbl)) {
-        contrasts_tbl$effect_size <- exp(contrasts_tbl$estimate)
+      emmeans_tbl_iv <- tryCatch(as.data.frame(emm), error = function(e) NULL)
+      if (!is.null(emmeans_tbl_iv)) {
+        emmeans_tbl_iv$IV <- iv
+        if (is.null(emmeans_tbl)) {
+          emmeans_tbl <- emmeans_tbl_iv
+        } else {
+          emmeans_tbl <- dplyr::bind_rows(emmeans_tbl, emmeans_tbl_iv)
+        }
       }
 
-      if (!is.null(emmeans_tbl) && first_iv %in% names(emmeans_tbl)) {
-        emmeans_plot_path <- file.path(output_dir, "figures", paste0("emmeans_", dv_name, ".png"))
-        dir.create(dirname(emmeans_plot_path), recursive = TRUE, showWarnings = FALSE)
+      contrasts_tbl_iv <- tryCatch(as.data.frame(contrast(emm, method = "pairwise", adjust = "none")), error = function(e) NULL)
+      if (!is.null(contrasts_tbl_iv)) {
+        contrasts_tbl_iv$IV <- iv
+        if ("estimate" %in% names(contrasts_tbl_iv)) {
+          contrasts_tbl_iv$effect_size <- exp(contrasts_tbl_iv$estimate)
+        } else {
+          contrasts_tbl_iv$effect_size <- NA_real_
+        }
+        if (is.null(contrasts_tbl)) {
+          contrasts_tbl <- contrasts_tbl_iv
+        } else {
+          contrasts_tbl <- dplyr::bind_rows(contrasts_tbl, contrasts_tbl_iv)
+        }
+      }
 
-        estimate_col <- pick_first_existing(c("response", "prob", "emmean"), names(emmeans_tbl))
-        lower_col <- pick_first_existing(c("lower.CL", "asymp.LCL", "LCL"), names(emmeans_tbl))
-        upper_col <- pick_first_existing(c("upper.CL", "asymp.UCL", "UCL"), names(emmeans_tbl))
+      if (!is.null(emmeans_tbl_iv) && iv %in% names(emmeans_tbl_iv)) {
+        iv_label <- gsub("[^A-Za-z0-9]+", "_", iv)
+        emmeans_plot_path_iv <- file.path(output_dir, "figures", paste0("emmeans_", dv_name, "_", iv_label, ".png"))
+        dir.create(dirname(emmeans_plot_path_iv), recursive = TRUE, showWarnings = FALSE)
+
+        estimate_col <- pick_first_existing(c("response", "prob", "emmean"), names(emmeans_tbl_iv))
+        lower_col <- pick_first_existing(c("lower.CL", "asymp.LCL", "LCL"), names(emmeans_tbl_iv))
+        upper_col <- pick_first_existing(c("upper.CL", "asymp.UCL", "UCL"), names(emmeans_tbl_iv))
 
         if (!is.null(estimate_col)) {
-          p <- ggplot(emmeans_tbl, aes(x = .data[[first_iv]], y = .data[[estimate_col]])) +
+          p <- ggplot(emmeans_tbl_iv, aes(x = .data[[iv]], y = .data[[estimate_col]])) +
             geom_point(size = 2) +
             labs(
-              title = paste0("Estimated Marginal Means: ", dv_name, " \u2014 between-subject"),
-              x = first_iv,
+              title = paste0("Estimated Marginal Means: ", dv_name, " — between-subject - ", iv),
+              x = iv,
               y = dv_name
             ) +
             theme_minimal(base_size = 12) +
@@ -1061,48 +1837,54 @@ analyze_single_dv <- function(
 
           if (!is.null(lower_col) && !is.null(upper_col)) {
             p <- p + geom_errorbar(aes(ymin = .data[[lower_col]], ymax = .data[[upper_col]]), width = 0.2)
-          } else {
-            warnings <- c(warnings, "EMMeans CI columns were not found; plot was generated without error bars.")
           }
 
-          tryCatch({
-            ggsave(emmeans_plot_path, plot = p, width = 7, height = 4.5, dpi = 150)
+          success <- tryCatch({
+            ggsave(emmeans_plot_path_iv, plot = p, width = 7, height = 4.5, dpi = 150)
+            TRUE
           }, error = function(e) {
-            warnings <<- c(warnings, paste0("EMMeans plot save failed: ", conditionMessage(e)))
-            emmeans_plot_path <<- NULL
+            warnings <<- c(warnings, paste0("EMMeans plot save failed for between-subject IV '", iv, "': ", conditionMessage(e)))
+            FALSE
           })
+
+          if (success && is.null(emmeans_plot_path)) {
+            emmeans_plot_path <- emmeans_plot_path_iv
+          }
         } else {
-          warnings <- c(warnings, "EMMeans estimate column was not found; EMMeans plot skipped.")
-          emmeans_plot_path <- NULL
+          warnings <- c(warnings, paste0("EMMeans estimate column was not found for IV '", iv, "'; plot skipped."))
         }
       }
     }
   }
 
-  if (!is.na(within_iv) && nzchar(within_iv)) {
-    emm_w <- tryCatch({
-      emmeans::emmeans(model, specs = within_iv, type = "response")
-    }, error = function(e) {
-      warnings <<- c(warnings, paste0("EMMeans within-subject failed: ", conditionMessage(e)))
-      NULL
-    })
+  if (length(within_fixed_ivs) > 0) {
+    for (iv in within_fixed_ivs) {
+      if (is.na(iv) || !nzchar(iv)) next
 
-    if (!is.null(emm_w)) {
-      emmeans_w_tbl <- tryCatch(as.data.frame(emm_w), error = function(e) NULL)
-      if (!is.null(emmeans_w_tbl) && within_iv %in% names(emmeans_w_tbl)) {
-        emmeans_within_plot_path <- file.path(output_dir, "figures", paste0("emmeans_", dv_name, "_within.png"))
-        dir.create(dirname(emmeans_within_plot_path), recursive = TRUE, showWarnings = FALSE)
+      emm_w <- tryCatch({
+        emmeans::emmeans(model, specs = iv, type = "response")
+      }, error = function(e) {
+        warnings <<- c(warnings, paste0("EMMeans within-subject failed for IV '", iv, "': ", conditionMessage(e)))
+        NULL
+      })
+      if (is.null(emm_w)) next
 
-        estimate_col_w <- pick_first_existing(c("response", "prob", "emmean"), names(emmeans_w_tbl))
-        lower_col_w    <- pick_first_existing(c("lower.CL", "asymp.LCL", "LCL"), names(emmeans_w_tbl))
-        upper_col_w    <- pick_first_existing(c("upper.CL", "asymp.UCL", "UCL"), names(emmeans_w_tbl))
+      emmeans_w_tbl_iv <- tryCatch(as.data.frame(emm_w), error = function(e) NULL)
+      if (!is.null(emmeans_w_tbl_iv) && iv %in% names(emmeans_w_tbl_iv)) {
+        iv_label <- gsub("[^A-Za-z0-9]+", "_", iv)
+        emmeans_within_plot_path_iv <- file.path(output_dir, "figures", paste0("emmeans_", dv_name, "_within_", iv_label, ".png"))
+        dir.create(dirname(emmeans_within_plot_path_iv), recursive = TRUE, showWarnings = FALSE)
+
+        estimate_col_w <- pick_first_existing(c("response", "prob", "emmean"), names(emmeans_w_tbl_iv))
+        lower_col_w    <- pick_first_existing(c("lower.CL", "asymp.LCL", "LCL"), names(emmeans_w_tbl_iv))
+        upper_col_w    <- pick_first_existing(c("upper.CL", "asymp.UCL", "UCL"), names(emmeans_w_tbl_iv))
 
         if (!is.null(estimate_col_w)) {
-          pw <- ggplot(emmeans_w_tbl, aes(x = .data[[within_iv]], y = .data[[estimate_col_w]])) +
+          pw <- ggplot(emmeans_w_tbl_iv, aes(x = .data[[iv]], y = .data[[estimate_col_w]])) +
             geom_point(size = 2) +
             labs(
-              title = paste0("Estimated Marginal Means: ", dv_name, " \u2014 within-subject"),
-              x = within_iv,
+              title = paste0("Estimated Marginal Means: ", dv_name, " — within-subject - ", iv),
+              x = iv,
               y = dv_name
             ) +
             theme_minimal(base_size = 12) +
@@ -1110,19 +1892,119 @@ analyze_single_dv <- function(
 
           if (!is.null(lower_col_w) && !is.null(upper_col_w)) {
             pw <- pw + geom_errorbar(aes(ymin = .data[[lower_col_w]], ymax = .data[[upper_col_w]]), width = 0.2)
-          } else {
-            warnings <- c(warnings, "EMMeans within-subject CI columns not found; plot generated without error bars.")
           }
 
-          tryCatch({
-            ggsave(emmeans_within_plot_path, plot = pw, width = 7, height = 4.5, dpi = 150)
+          success <- tryCatch({
+            ggsave(emmeans_within_plot_path_iv, plot = pw, width = 7, height = 4.5, dpi = 150)
+            TRUE
           }, error = function(e) {
-            warnings <<- c(warnings, paste0("EMMeans within-subject plot save failed: ", conditionMessage(e)))
-            emmeans_within_plot_path <<- NULL
+            warnings <<- c(warnings, paste0("EMMeans within-subject plot save failed for IV '", iv, "': ", conditionMessage(e)))
+            FALSE
           })
+
+          if (success && is.null(emmeans_within_plot_path)) {
+            emmeans_within_plot_path <- emmeans_within_plot_path_iv
+          }
         } else {
-          warnings <- c(warnings, "EMMeans within-subject estimate column not found; plot skipped.")
-          emmeans_within_plot_path <- NULL
+          warnings <- c(warnings, paste0("EMMeans within-subject estimate column was not found for IV '", iv, "'; plot skipped."))
+        }
+      }
+    }
+  }
+
+  interaction_emmeans_tbl <- NULL
+  interaction_contrasts_tbl <- NULL
+  interaction_plots <- list()
+
+  if (!is.null(model) && !is.null(fixed_vars) && length(fixed_vars) > 1) {
+    interaction_terms <- extract_interaction_terms(model, fixed_vars)
+
+    if (length(interaction_terms) > 0) {
+      for (interaction in interaction_terms) {
+        parts <- strsplit(interaction, " : ")[[1]]
+        if (length(parts) != 2) next
+
+        iv1 <- trimws(parts[1])
+        iv2 <- trimws(parts[2])
+
+        if (!nzchar(iv1) || !nzchar(iv2)) next
+
+        emm_int <- tryCatch({
+          emmeans::emmeans(model, specs = c(iv1, iv2), type = "response")
+        }, error = function(e) {
+          warnings <<- c(warnings, paste0("EMMeans failed for interaction '", iv1, " x ", iv2, "': ", conditionMessage(e)))
+          NULL
+        })
+
+        if (is.null(emm_int)) next
+
+        emmeans_int_tbl_iv <- tryCatch(as.data.frame(emm_int), error = function(e) NULL)
+        if (!is.null(emmeans_int_tbl_iv)) {
+          emmeans_int_tbl_iv$interaction_term <- interaction
+          emmeans_int_tbl_iv$IV1 <- iv1
+          emmeans_int_tbl_iv$IV2 <- iv2
+          if (is.null(interaction_emmeans_tbl)) {
+            interaction_emmeans_tbl <- emmeans_int_tbl_iv
+          } else {
+            interaction_emmeans_tbl <- dplyr::bind_rows(interaction_emmeans_tbl, emmeans_int_tbl_iv)
+          }
+        }
+
+        contrasts_int_tbl_iv <- tryCatch(as.data.frame(contrast(emm_int, method = "pairwise", adjust = "none")), error = function(e) NULL)
+        if (!is.null(contrasts_int_tbl_iv)) {
+          contrasts_int_tbl_iv$interaction_term <- interaction
+          contrasts_int_tbl_iv$IV1 <- iv1
+          contrasts_int_tbl_iv$IV2 <- iv2
+          if ("estimate" %in% names(contrasts_int_tbl_iv)) {
+            contrasts_int_tbl_iv$effect_size <- exp(contrasts_int_tbl_iv$estimate)
+          } else {
+            contrasts_int_tbl_iv$effect_size <- NA_real_
+          }
+          if (is.null(interaction_contrasts_tbl)) {
+            interaction_contrasts_tbl <- contrasts_int_tbl_iv
+          } else {
+            interaction_contrasts_tbl <- dplyr::bind_rows(interaction_contrasts_tbl, contrasts_int_tbl_iv)
+          }
+        }
+
+        if (!is.null(emmeans_int_tbl_iv)) {
+          iv_label <- paste0(gsub("[^A-Za-z0-9]+", "_", iv1), "_x_", gsub("[^A-Za-z0-9]+", "_", iv2))
+          interaction_plot_path_iv <- file.path(output_dir, "figures", paste0("emmeans_", dv_name, "_interaction_", iv_label, ".png"))
+          dir.create(dirname(interaction_plot_path_iv), recursive = TRUE, showWarnings = FALSE)
+
+          estimate_col_int <- pick_first_existing(c("response", "prob", "emmean"), names(emmeans_int_tbl_iv))
+          lower_col_int <- pick_first_existing(c("lower.CL", "asymp.LCL", "LCL"), names(emmeans_int_tbl_iv))
+          upper_col_int <- pick_first_existing(c("upper.CL", "asymp.UCL", "UCL"), names(emmeans_int_tbl_iv))
+
+          if (!is.null(estimate_col_int) && iv1 %in% names(emmeans_int_tbl_iv) && iv2 %in% names(emmeans_int_tbl_iv)) {
+            p_int <- ggplot(emmeans_int_tbl_iv, aes(x = .data[[iv1]], y = .data[[estimate_col_int]], color = factor(.data[[iv2]]), group = factor(.data[[iv2]]))) +
+              geom_point(size = 2) +
+              geom_line() +
+              labs(
+                title = paste0("Interaction Plot: ", dv_name, " — ", iv1, " x ", iv2),
+                x = iv1,
+                y = dv_name,
+                color = iv2
+              ) +
+              theme_minimal(base_size = 12) +
+              coord_cartesian(ylim = c(0, NA))
+
+            if (!is.null(lower_col_int) && !is.null(upper_col_int)) {
+              p_int <- p_int + geom_errorbar(aes(ymin = .data[[lower_col_int]], ymax = .data[[upper_col_int]]), width = 0.2)
+            }
+
+            success_int <- tryCatch({
+              ggsave(interaction_plot_path_iv, plot = p_int, width = 8, height = 5, dpi = 150)
+              TRUE
+            }, error = function(e) {
+              warnings <<- c(warnings, paste0("Interaction plot save failed for '", interaction, "': ", conditionMessage(e)))
+              FALSE
+            })
+
+            if (success_int) {
+              interaction_plots[[length(interaction_plots) + 1]] <- interaction_plot_path_iv
+            }
+          }
         }
       }
     }
@@ -1168,6 +2050,7 @@ analyze_single_dv <- function(
     n_used = nrow(model_df),
     n_na = n_na,
     selected_random = selected_random,
+    family_used = used_family,
     zero_one_detected = zero_one_detected,
     boundary_method_note = boundary_method_note,
     used_zi = used_zi,
@@ -1175,12 +2058,18 @@ analyze_single_dv <- function(
     plan_b_used = plan_b_used,
     plan_b_note = plan_b_note,
     fit_errors = fit_errors,
+    fit_warnings = fit_warnings,
     warnings = warnings,
     method_text = method_text,
+    formula_used = build_formula_display(response_col, fixed_formula_text, selected_random, formula_override = custom_formula, animal_id = animal_id),
     fixed_effects = fixed_tbl,
+    wald_tests = wald_tests_tbl,
     r2 = r2_values,
     emmeans = emmeans_tbl,
     contrasts = contrasts_tbl,
+    interaction_emmeans = interaction_emmeans_tbl,
+    interaction_contrasts = interaction_contrasts_tbl,
+    interaction_plot_paths = interaction_plots,
     effect_metric = effect_metric,
     qq_plot_path = qq_plot_path,
     emmeans_plot_path = emmeans_plot_path,
@@ -1229,7 +2118,20 @@ analyze_multinomial_glmm <- function(
   }
 
   needed_cols <- unique(c(animal_id, iv_names, behavior_cols, non_visible_col))
-  model_df <- df %>% dplyr::select(all_of(needed_cols))
+  needed_cols <- needed_cols[!vapply(needed_cols, function(x) is.null(x) || length(x) == 0 || is.na(x) || !nzchar(trimws(as.character(x))), logical(1))]
+  resolved_needed_cols <- resolve_column_names(needed_cols, names(df))
+  missing_cols <- needed_cols[is.na(resolved_needed_cols)]
+  if (length(missing_cols) > 0) {
+    return(list(
+      status = "failed",
+      message = paste0("Missing required columns for multinomial analysis: ", paste(missing_cols, collapse = ", ")),
+      warnings = character(0),
+      n_total = 0,
+      n_long = 0,
+      formula = NULL
+    ))
+  }
+  model_df <- df %>% dplyr::select(all_of(resolved_needed_cols))
   n_total <- nrow(model_df)
 
   for (b in behavior_cols) {
@@ -1364,6 +2266,8 @@ analyze_multinomial_glmm <- function(
     list(marginal = NA_real_, conditional = NA_real_)
   })
 
+  wald_tests_tbl <- get_wald_tests(model)
+
   contrasts_all <- list()
   for (iv in iv_names) {
     if (!(iv %in% names(long_df))) next
@@ -1420,6 +2324,7 @@ analyze_multinomial_glmm <- function(
     formula = deparse(model_formula),
     warnings = unique(warnings),
     fit_errors = fit_errors,
+    wald_tests = wald_tests_tbl,
     r2 = r2_values,
     contrasts = contrasts_tbl,
     qq_plot_path = qq_plot_path,
@@ -1431,7 +2336,7 @@ analyze_multinomial_glmm <- function(
   )
 }
 
-build_markdown_report <- function(input_cfg, analysis_results, output_dir, timestamp_str, multinomial_result = NULL) {
+build_markdown_report <- function(input_cfg, analysis_results, output_dir, timestamp_str, multinomial_result = NULL, program_name = NULL, computer_id = NULL, run_timestamp = NULL) {
   report_md <- file.path(output_dir, paste0("report_", timestamp_str, ".md"))
 
   iv_lines <- vapply(input_cfg$iv, function(x) {
@@ -1444,6 +2349,35 @@ build_markdown_report <- function(input_cfg, analysis_results, output_dir, times
     paste0("- ", x$name, " (", x$type, ")")
   }, character(1))
 
+  formula_lines <- character(0)
+  if (!is.null(input_cfg$custom_formula) && nzchar(trimws(input_cfg$custom_formula))) {
+    formula_lines <- c(formula_lines, paste0("- General formula (DV = dependent variable): ", input_cfg$custom_formula))
+  }
+  for (res in analysis_results) {
+    if (!is.null(res$analyses)) {
+      for (nm in names(res$analyses)) {
+        sub <- res$analyses[[nm]]
+        formula_text <- list_get(sub, "formula_used", NULL)
+        if (!is.null(formula_text) && nzchar(formula_text)) {
+          formula_lines <- c(formula_lines, paste0("- ", list_get(res, "dv", "Unknown DV"), " / ", nm, ": ", formula_text))
+        }
+      }
+    } else {
+      formula_text <- list_get(res, "formula_used", NULL)
+      if (!is.null(formula_text) && nzchar(formula_text)) {
+        formula_lines <- c(formula_lines, paste0("- ", list_get(res, "dv", "Unknown DV"), ": ", formula_text))
+      }
+    }
+  }
+
+  if (length(formula_lines) == 0 && !is.null(multinomial_result) && !is.null(multinomial_result$formula) && nzchar(multinomial_result$formula)) {
+    formula_lines <- c(formula_lines, paste0("- Multinomial GLMM formula: ", multinomial_result$formula))
+  }
+
+  effective_program_name <- if (!is.null(program_name) && nzchar(program_name)) program_name else "unknown"
+  effective_computer_id <- if (!is.null(computer_id) && nzchar(computer_id)) computer_id else Sys.info()[["nodename"]]
+  effective_run_timestamp <- if (!is.null(run_timestamp) && nzchar(run_timestamp)) run_timestamp else format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+
   lines <- c(
     "# LabStats GLMM Report",
     "",
@@ -1452,7 +2386,9 @@ build_markdown_report <- function(input_cfg, analysis_results, output_dir, times
     paste0("- Input file: ", input_cfg$input),
     paste0("- Sheet: ", input_cfg$sheet),
     paste0("- Animal ID: ", input_cfg$animal_id),
-    paste0("- Run timestamp: ", timestamp_str),
+    paste0("- Run timestamp: ", effective_run_timestamp),
+    paste0("- Program used: ", effective_program_name),
+    paste0("- Computer ID: ", effective_computer_id),
     paste0("- R version: ", R.version.string),
     "",
     "### Independent Variables",
@@ -1460,6 +2396,9 @@ build_markdown_report <- function(input_cfg, analysis_results, output_dir, times
     "",
     "### Dependent Variables",
     dv_lines,
+    "",
+    "### Model formulas",
+    formula_lines,
     "",
     "## Section 1 - Methods"
   )
@@ -1491,6 +2430,18 @@ build_markdown_report <- function(input_cfg, analysis_results, output_dir, times
     lines <- c(lines, paste0("- Status: ", res_status))
     lines <- c(lines, paste0("- Used rows: ", res_n_used, " / ", res_n_total, " (NA dropped: ", res_n_na, ")"))
     lines <- c(lines, paste0("- Random structure/model: ", res_selected_random))
+    if (!is.null(res$formula_used) && nzchar(res$formula_used)) {
+      lines <- c(lines, paste0("- Model formula: ", res$formula_used))
+    }
+    if (!is.null(res$family_used) && nzchar(res$family_used)) {
+      lines <- c(lines, paste0("- Family used: ", res$family_used))
+    }
+    if (!is.null(res$fit_warnings) && length(res$fit_warnings) > 0) {
+      lines <- c(lines, "", "Convergence messages/warnings:")
+      for (w in res$fit_warnings) {
+        lines <- c(lines, paste0("  - ", w))
+      }
+    }
 
     if (!is.null(res$analyses)) {
       if (!is.null(res$non_visible_column)) {
@@ -1507,6 +2458,9 @@ build_markdown_report <- function(input_cfg, analysis_results, output_dir, times
         lines <- c(lines, paste0("- Family used: ", list_get(sub, "family_used", "N/A")))
         lines <- c(lines, paste0("- Used rows: ", list_get(sub, "n_used", NA_integer_)))
         lines <- c(lines, paste0("- Random structure/model: ", list_get(sub, "selected_random", "N/A")))
+        if (!is.null(sub$formula_used) && nzchar(sub$formula_used)) {
+          lines <- c(lines, paste0("- Model formula: ", sub$formula_used))
+        }
 
         if (!is.null(sub$r2)) {
           lines <- c(lines, paste0("- Nakagawa R2 marginal: ", signif(sub$r2$marginal, 4)))
@@ -1525,6 +2479,20 @@ build_markdown_report <- function(input_cfg, analysis_results, output_dir, times
           lines <- c(lines, fe_lines)
         }
 
+        if (!is.null(sub$wald_tests) && nrow(sub$wald_tests) > 0) {
+          lines <- c(lines, "", "Type III Wald tests:", "")
+          wt <- sub$wald_tests
+          p_col <- if ("Pr(>Chisq)" %in% names(wt)) "Pr(>Chisq)" else if ("Pr(>F)" %in% names(wt)) "Pr(>F)" else "p.value"
+          stat_col <- if ("Chisq" %in% names(wt)) "Chisq" else if ("F" %in% names(wt)) "F" else "statistic"
+          wt_lines <- sapply(1:nrow(wt), function(i) {
+            term <- if ("term" %in% names(wt)) wt$term[i] else rownames(wt)[i]
+            stat <- if (stat_col %in% names(wt)) wt[[stat_col]][i] else NA_real_
+            pval <- if (p_col %in% names(wt)) wt[[p_col]][i] else NA_real_
+            paste0("- ", term, ": ", stat_col, "=", signif(stat, 4), ", p=", format_p(pval), " ", sig_code(pval))
+          })
+          lines <- c(lines, wt_lines)
+        }
+
         if (!is.null(sub$contrasts) && nrow(sub$contrasts) > 0) {
           lines <- c(lines, "", paste0("Post-hoc contrasts (", list_get(sub, "effect_metric", "effect"), ") -- raw p / cross-DV FDR p:"), "")
           ct <- sub$contrasts
@@ -1540,15 +2508,60 @@ build_markdown_report <- function(input_cfg, analysis_results, output_dir, times
           lines <- c(lines, ct_lines)
         }
 
+        if (!is.null(res$interaction_emmeans) && nrow(res$interaction_emmeans) > 0) {
+          lines <- c(lines, "", "Interaction EMMs:", "")
+          int_emm <- res$interaction_emmeans
+          int_emm_lines <- apply(int_emm, 1, function(row) {
+            interaction <- ifelse("interaction_term" %in% names(int_emm), as.character(row[["interaction_term"]]), "interaction")
+            estimate_col <- pick_first_existing(c("response", "prob", "emmean"), names(int_emm))
+            est <- if (!is.null(estimate_col) && estimate_col %in% names(int_emm)) as.numeric(row[[estimate_col]]) else NA_real_
+            paste0("- ", interaction, ": ", signif(est, 4))
+          })
+          lines <- c(lines, int_emm_lines)
+        }
+
+        if (!is.null(res$interaction_contrasts) && nrow(res$interaction_contrasts) > 0) {
+          lines <- c(lines, "", paste0("Interaction post-hoc contrasts (", list_get(res, "effect_metric", "effect"), ") -- raw p / cross-DV FDR p:"), "")
+          int_ct <- res$interaction_contrasts
+          int_ct_lines <- apply(int_ct, 1, function(row) {
+            interaction <- ifelse("interaction_term" %in% names(int_ct), as.character(row[["interaction_term"]]), "interaction")
+            contrast_name <- ifelse("contrast" %in% names(int_ct), as.character(row[["contrast"]]), "")
+            pval_raw <- ifelse("p.value" %in% names(int_ct), as.numeric(row[["p.value"]]), NA_real_)
+            pval_fdr <- ifelse("p.value_fdr" %in% names(int_ct), as.numeric(row[["p.value_fdr"]]), pval_raw)
+            eff <- ifelse("effect_size" %in% names(int_ct), as.numeric(row[["effect_size"]]), NA_real_)
+            paste0("- ", interaction, " / ", contrast_name, ": effect=", signif(eff, 4),
+                   ", p_raw=", format_p(pval_raw),
+                   ", p_fdr=", format_p(pval_fdr), " ", sig_code(pval_fdr))
+          })
+          lines <- c(lines, int_ct_lines)
+        }
+
+        if (!is.null(res$interaction_plot_paths) && length(res$interaction_plot_paths) > 0) {
+          for (path in res$interaction_plot_paths) {
+            lines <- c(lines, paste0("- Interaction plot: ", path))
+            lines <- c(lines, report_image_markdown(path))
+          }
+        }
+
         if (!is.null(sub$qq_plot_path)) {
           lines <- c(lines, paste0("- DHARMa plot: ", sub$qq_plot_path))
           lines <- c(lines, report_image_markdown(sub$qq_plot_path))
         }
-        if (!is.null(sub$emmeans_plot_path)) {
+        if (!is.null(sub$emmeans_plot_paths) && length(sub$emmeans_plot_paths) > 0) {
+          for (path in sub$emmeans_plot_paths) {
+            lines <- c(lines, paste0("- EMMeans plot (between-subject): ", path))
+            lines <- c(lines, report_image_markdown(path))
+          }
+        } else if (!is.null(sub$emmeans_plot_path)) {
           lines <- c(lines, paste0("- EMMeans plot (between-subject): ", sub$emmeans_plot_path))
           lines <- c(lines, report_image_markdown(sub$emmeans_plot_path))
         }
-        if (!is.null(sub$emmeans_within_plot_path)) {
+        if (!is.null(sub$emmeans_within_plot_paths) && length(sub$emmeans_within_plot_paths) > 0) {
+          for (path in sub$emmeans_within_plot_paths) {
+            lines <- c(lines, paste0("- EMMeans plot (within-subject): ", path))
+            lines <- c(lines, report_image_markdown(path))
+          }
+        } else if (!is.null(sub$emmeans_within_plot_path)) {
           lines <- c(lines, paste0("- EMMeans plot (within-subject): ", sub$emmeans_within_plot_path))
           lines <- c(lines, report_image_markdown(sub$emmeans_within_plot_path))
         }
@@ -1584,6 +2597,20 @@ build_markdown_report <- function(input_cfg, analysis_results, output_dir, times
         })
         lines <- c(lines, fe_rt_lines)
       }
+
+      if (!is.null(rt$wald_tests) && nrow(rt$wald_tests) > 0) {
+        lines <- c(lines, "", "log(RT) LMM Type III Wald tests:", "")
+        wt <- rt$wald_tests
+        p_col <- if ("Pr(>Chisq)" %in% names(wt)) "Pr(>Chisq)" else if ("Pr(>F)" %in% names(wt)) "Pr(>F)" else "p.value"
+        stat_col <- if ("Chisq" %in% names(wt)) "Chisq" else if ("F" %in% names(wt)) "F" else "statistic"
+        wt_lines <- sapply(1:nrow(wt), function(i) {
+          term <- if ("term" %in% names(wt)) wt$term[i] else rownames(wt)[i]
+          stat <- if (stat_col %in% names(wt)) wt[[stat_col]][i] else NA_real_
+          pval <- if (p_col %in% names(wt)) wt[[p_col]][i] else NA_real_
+          paste0("- ", term, ": ", stat_col, "=", signif(stat, 4), ", p=", format_p(pval), " ", sig_code(pval))
+        })
+        lines <- c(lines, wt_lines)
+      }
     }
 
     if (!is.null(res$fixed_effects) && nrow(res$fixed_effects) > 0) {
@@ -1596,6 +2623,22 @@ build_markdown_report <- function(input_cfg, analysis_results, output_dir, times
         paste0("- ", term, ": estimate=", signif(est, 4), ", p=", format_p(pval), " ", sig_code(pval))
       })
       lines <- c(lines, fe_lines)
+    }
+
+    if (!is.null(res$wald_tests) && is.data.frame(res$wald_tests) && nrow(res$wald_tests) > 0) {
+      lines <- c(lines, "", "Type III Wald tests:", "")
+      wt <- res$wald_tests
+      p_col <- if ("Pr(>Chisq)" %in% names(wt)) "Pr(>Chisq)" else if ("Pr(>F)" %in% names(wt)) "Pr(>F)" else "p.value"
+      stat_col <- if ("Chisq" %in% names(wt)) "Chisq" else if ("F" %in% names(wt)) "F" else "statistic"
+      wt_lines <- sapply(1:nrow(wt), function(i) {
+        term <- if ("term" %in% names(wt)) wt$term[i] else rownames(wt)[i]
+        stat <- if (stat_col %in% names(wt)) wt[[stat_col]][i] else NA_real_
+        pval <- if (p_col %in% names(wt)) wt[[p_col]][i] else NA_real_
+        paste0("- ", term, ": ", stat_col, "=", signif(stat, 4), ", p=", format_p(pval), " ", sig_code(pval))
+      })
+      lines <- c(lines, wt_lines)
+    } else if (is.null(res$wald_tests) && res_status == "ok") {
+      lines <- c(lines, "", "Type III Wald tests: Not available (test computation returned NULL)")
     }
 
     if (!is.null(res$contrasts) && nrow(res$contrasts) > 0) {
@@ -1613,15 +2656,60 @@ build_markdown_report <- function(input_cfg, analysis_results, output_dir, times
       lines <- c(lines, ct_lines)
     }
 
+    if (!is.null(res$interaction_emmeans) && nrow(res$interaction_emmeans) > 0) {
+      lines <- c(lines, "", "Interaction EMMs:", "")
+      int_emm <- res$interaction_emmeans
+      int_emm_lines <- apply(int_emm, 1, function(row) {
+        interaction <- ifelse("interaction_term" %in% names(int_emm), as.character(row[["interaction_term"]]), "interaction")
+        estimate_col <- pick_first_existing(c("response", "prob", "emmean"), names(int_emm))
+        est <- if (!is.null(estimate_col) && estimate_col %in% names(int_emm)) as.numeric(row[[estimate_col]]) else NA_real_
+        paste0("- ", interaction, ": ", signif(est, 4))
+      })
+      lines <- c(lines, int_emm_lines)
+    }
+
+    if (!is.null(res$interaction_contrasts) && nrow(res$interaction_contrasts) > 0) {
+      lines <- c(lines, "", paste0("Interaction post-hoc contrasts (", res$effect_metric, ") -- raw p / cross-DV FDR p:"), "")
+      int_ct <- res$interaction_contrasts
+      int_ct_lines <- apply(int_ct, 1, function(row) {
+        interaction <- ifelse("interaction_term" %in% names(int_ct), as.character(row[["interaction_term"]]), "interaction")
+        contrast_name <- ifelse("contrast" %in% names(int_ct), as.character(row[["contrast"]]), "")
+        pval_raw <- ifelse("p.value" %in% names(int_ct), as.numeric(row[["p.value"]]), NA_real_)
+        pval_fdr <- ifelse("p.value_fdr" %in% names(int_ct), as.numeric(row[["p.value_fdr"]]), pval_raw)
+        eff <- ifelse("effect_size" %in% names(int_ct), as.numeric(row[["effect_size"]]), NA_real_)
+        paste0("- ", interaction, " / ", contrast_name, ": effect=", signif(eff, 4),
+               ", p_raw=", format_p(pval_raw),
+               ", p_fdr=", format_p(pval_fdr), " ", sig_code(pval_fdr))
+      })
+      lines <- c(lines, int_ct_lines)
+    }
+
+    if (!is.null(res$interaction_plot_paths) && length(res$interaction_plot_paths) > 0) {
+      for (path in res$interaction_plot_paths) {
+        lines <- c(lines, paste0("- Interaction plot: ", path))
+        lines <- c(lines, report_image_markdown(path))
+      }
+    }
+
     if (!is.null(res$qq_plot_path)) {
       lines <- c(lines, paste0("- DHARMa plot: ", res$qq_plot_path))
       lines <- c(lines, report_image_markdown(res$qq_plot_path))
     }
-    if (!is.null(res$emmeans_plot_path)) {
+    if (!is.null(res$emmeans_plot_paths) && length(res$emmeans_plot_paths) > 0) {
+      for (path in res$emmeans_plot_paths) {
+        lines <- c(lines, paste0("- EMMeans plot (between-subject): ", path))
+        lines <- c(lines, report_image_markdown(path))
+      }
+    } else if (!is.null(res$emmeans_plot_path)) {
       lines <- c(lines, paste0("- EMMeans plot (between-subject): ", res$emmeans_plot_path))
       lines <- c(lines, report_image_markdown(res$emmeans_plot_path))
     }
-    if (!is.null(res$emmeans_within_plot_path)) {
+    if (!is.null(res$emmeans_within_plot_paths) && length(res$emmeans_within_plot_paths) > 0) {
+      for (path in res$emmeans_within_plot_paths) {
+        lines <- c(lines, paste0("- EMMeans plot (within-subject): ", path))
+        lines <- c(lines, report_image_markdown(path))
+      }
+    } else if (!is.null(res$emmeans_within_plot_path)) {
       lines <- c(lines, paste0("- EMMeans plot (within-subject): ", res$emmeans_within_plot_path))
       lines <- c(lines, report_image_markdown(res$emmeans_within_plot_path))
     }
@@ -1899,7 +2987,10 @@ for (dv in dv_list) {
     iv_scopes = iv_scopes,
     observation_cycle = observation_cycle,
     non_visible_column = list_get(dv, "non_visible_column", NULL),
-    output_dir = output_dir
+    output_dir = output_dir,
+    custom_formula = list_get(cfg, "custom_formula", NULL),
+    cbind_pair_with = list_get(dv, "cbind_pair_with", NULL),
+    cbind_pair_index = list_get(dv, "cbind_pair_index", NULL)
   )
   results[[length(results) + 1]] <- res
 }
@@ -1934,7 +3025,15 @@ if (run_multinomial) {
           start      <- length(all_pvals) + 1
           all_pvals  <- c(all_pvals, ct$p.value)
           pval_index[[length(pval_index) + 1]] <- list(
-            res_idx = i, sub = sub_nm, rows = start:length(all_pvals)
+            res_idx = i, sub = sub_nm, rows = start:length(all_pvals), type = "contrasts"
+          )
+        }
+        int_ct <- res$analyses[[sub_nm]]$interaction_contrasts
+        if (!is.null(int_ct) && is.data.frame(int_ct) && "p.value" %in% names(int_ct) && nrow(int_ct) > 0) {
+          start      <- length(all_pvals) + 1
+          all_pvals  <- c(all_pvals, int_ct$p.value)
+          pval_index[[length(pval_index) + 1]] <- list(
+            res_idx = i, sub = sub_nm, rows = start:length(all_pvals), type = "interaction_contrasts"
           )
         }
       }
@@ -1944,7 +3043,15 @@ if (run_multinomial) {
         start      <- length(all_pvals) + 1
         all_pvals  <- c(all_pvals, ct$p.value)
         pval_index[[length(pval_index) + 1]] <- list(
-          res_idx = i, sub = NULL, rows = start:length(all_pvals)
+          res_idx = i, sub = NULL, rows = start:length(all_pvals), type = "contrasts"
+        )
+      }
+      int_ct <- res$interaction_contrasts
+      if (!is.null(int_ct) && is.data.frame(int_ct) && "p.value" %in% names(int_ct) && nrow(int_ct) > 0) {
+        start      <- length(all_pvals) + 1
+        all_pvals  <- c(all_pvals, int_ct$p.value)
+        pval_index[[length(pval_index) + 1]] <- list(
+          res_idx = i, sub = NULL, rows = start:length(all_pvals), type = "interaction_contrasts"
         )
       }
     }
@@ -1954,10 +3061,19 @@ if (run_multinomial) {
     adj_pvals <- p.adjust(all_pvals, method = "fdr")
     for (pm in pval_index) {
       adj <- adj_pvals[pm$rows]
+      contrast_type <- if (!is.null(pm$type)) pm$type else "contrasts"
       if (!is.null(pm$sub)) {
-        results[[pm$res_idx]]$analyses[[pm$sub]]$contrasts$p.value_fdr <- adj
+        if (contrast_type == "interaction_contrasts") {
+          results[[pm$res_idx]]$analyses[[pm$sub]]$interaction_contrasts$p.value_fdr <- adj
+        } else {
+          results[[pm$res_idx]]$analyses[[pm$sub]]$contrasts$p.value_fdr <- adj
+        }
       } else {
-        results[[pm$res_idx]]$contrasts$p.value_fdr <- adj
+        if (contrast_type == "interaction_contrasts") {
+          results[[pm$res_idx]]$interaction_contrasts$p.value_fdr <- adj
+        } else {
+          results[[pm$res_idx]]$contrasts$p.value_fdr <- adj
+        }
       }
     }
     message_line(
@@ -1968,7 +3084,16 @@ if (run_multinomial) {
 }
 # ---- End cross-DV FDR -------------------------------------------------------
 
-report_md <- build_markdown_report(cfg, results, output_dir, timestamp_str, multinomial_result = multinomial_result)
+report_md <- build_markdown_report(
+  cfg,
+  results,
+  output_dir,
+  timestamp_str,
+  multinomial_result = multinomial_result,
+  program_name = list_get(cfg, "program_name", NULL),
+  computer_id = list_get(cfg, "computer_id", NULL),
+  run_timestamp = list_get(cfg, "run_timestamp", NULL)
+)
 rendered <- attempt_render(report_md, output_dir, timestamp_str)
 report_pdf_copy <- write_markdown_pdf_copy(report_md, output_dir, timestamp_str)
 
