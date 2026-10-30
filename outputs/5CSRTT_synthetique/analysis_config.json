@@ -1,0 +1,46 @@
+{
+  "input": "C:\\Users\\pfh3221\\OneDrive - Université de Moncton\\Documents\\GitHub2\\gLMM_GUI_R\\5CSRTT_synthetique.xlsx",
+  "sheet": "sessions",
+  "animal_id": "animal_id",
+  "iv": [
+    {
+      "name": "cage_id",
+      "model_role": "fixed_effect",
+      "subject_scope": "between_subject",
+      "type": "between",
+      "structure": "nothing"
+    },
+    {
+      "name": "cohort_id",
+      "model_role": "fixed_effect",
+      "subject_scope": "between_subject",
+      "type": "between"
+    },
+    {
+      "name": "sex",
+      "model_role": "fixed_effect",
+      "subject_scope": "between_subject",
+      "type": "between"
+    },
+    {
+      "name": "treatment",
+      "model_role": "fixed_effect",
+      "subject_scope": "between_subject",
+      "type": "between"
+    }
+  ],
+  "dv": [
+    {
+      "name": "block_n",
+      "type": "counts"
+    }
+  ],
+  "run_multinomial": false,
+  "observation_cycle": 30,
+  "output_dir": "C:\\Users\\pfh3221\\OneDrive - Université de Moncton\\Documents\\GitHub2\\gLMM_GUI_R\\outputs\\5CSRTT_synthetique",
+  "requested_at": "2026-10-30T13:36:16",
+  "run_timestamp": "2026-10-30 13:36:16",
+  "program_name": "glmm_analyzer_r_301026.py",
+  "computer_id": "LT27971",
+  "custom_formula": "DV ~ `cage_id` + `cohort_id` + `sex` + `treatment` + (1 | `animal_id`)"
+}
